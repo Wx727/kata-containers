@@ -6,6 +6,7 @@ use crate::{Hypervisor, MemoryConfig, VcpuThreadIds};
 use crate::HypervisorConfig;
 use inner::ShyperInner;
 use kata_types::capabilities::{Capabilities, CapabilityBits};
+use persist::sandbox_persist::Persist;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -98,17 +99,14 @@ impl Hypervisor for Shyper {
         }
 
         // 2) 尝试读取环境变量（便于调试/运行时覆盖）
-        if let Ok(env_sock) = env::var("KATA_AGENT_SOCKET") {
-            if !env_sock.is_empty() {
-                return Ok(env_sock);
+        if let Ok(addr) = env::var("KATA_AGENT_SERVER_ADDR") {
+            if !addr.is_empty() {
+                return Ok(addr);
             }
         }
 
-        // 3) 最后返回一个合理的默认值（unix socket 路径优先）
-        //    这个默认值与你的 guest-agent 配置要一致；若使用 TCP/virtio-net，可用 "tcp://127.0.0.1:10000"
-        //    你可以根据实际需要替换为 tcp 地址（例如 "127.0.0.1:10000"）或 unix 路径。
-        //    这里采用 unix socket 的默认路径（常见于 kata 安装）：/run/kata-containers/agent.sock
-        Ok(String::from("unix:///run/kata-containers/agent.sock"))
+        // 3) 默认值
+        Ok("vsock://3:1024".to_string())
     }
 
     // 核心：获取 VMM 进程 ID
@@ -177,7 +175,8 @@ impl Hypervisor for Shyper {
     }
 
     async fn get_ns_path(&self) -> Result<String> {
-        Ok(String::new())
+        let inner = self.inner.read().await;
+        inner.get_ns_path().await
     }
 
     async fn check(&self) -> Result<()> {
@@ -190,11 +189,13 @@ impl Hypervisor for Shyper {
     }
 
     async fn save_state(&self) -> Result<HypervisorState> {
-        Ok(HypervisorState::default())
+        self.save().await
     }
 
     async fn capabilities(&self) -> Result<Capabilities> {
-        Ok(Capabilities::default())
+        let mut caps = Capabilities::default();
+        caps.set(CapabilityBits::FsSharingSupport);
+        Ok(caps)
     }
 
     async fn get_hypervisor_metrics(&self) -> Result<String> {
@@ -211,5 +212,31 @@ impl Hypervisor for Shyper {
 
     async fn get_passfd_listener_addr(&self) -> Result<(String, u32)> {
         Ok((String::new(), 0))
+    }
+}
+
+#[async_trait]
+impl Persist for Shyper {
+    type State = HypervisorState;
+    type ConstructorArgs = ();
+
+    /// Save a state of the component.
+    async fn save(&self) -> Result<Self::State> {
+        let inner = self.inner.read().await;
+        inner.save().await
+    }
+
+    /// Restore a component from a specified state.
+    async fn restore(
+        _hypervisor_args: Self::ConstructorArgs,
+        hypervisor_state: Self::State,
+    ) -> Result<Self> {
+        let (exit_notify, exit_waiter) = mpsc::channel(1);
+
+        let inner = ShyperInner::restore(exit_notify, hypervisor_state).await?;
+        Ok(Self {
+            inner: Arc::new(RwLock::new(inner)),
+            exit_waiter: Mutex::new((exit_waiter, 0)),
+        })
     }
 }

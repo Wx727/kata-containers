@@ -1,8 +1,11 @@
 use crate::HypervisorConfig;
 use crate::shyper::sl;
+use crate::hypervisor_persist::HypervisorState;
+use crate::HYPERVISOR_SHYPER;
 
 use anyhow::{anyhow, Context, Result};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
+use std::fs::File;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::Mutex;
 use std::sync::Arc;
@@ -52,6 +55,12 @@ impl ShyperInner {
         // 如果脚本里面使用了相对路径（例如 ./shyper_rk3588），设置工作目录
         cmd.current_dir("/root");
 
+        // Redirect stdout/stderr to files for debugging
+        let stdout_file = File::create("/tmp/shyper_vm.stdout").context("failed to create stdout log")?;
+        let stderr_file = File::create("/tmp/shyper_vm.stderr").context("failed to create stderr log")?;
+        cmd.stdout(Stdio::from(stdout_file));
+        cmd.stderr(Stdio::from(stderr_file));
+
         info!(sl(), "Attempting to run boot script: {:?}", cmd);
 
         // spawn 子进程（非阻塞）
@@ -63,13 +72,34 @@ impl ShyperInner {
 
         // 后台等待子进程退出，并在退出时通知
         tokio::task::spawn_blocking(move || {
-            // blocking_lock 会阻塞直到能获取 Mutex
-            let mut vm_proc_guard = vm_process_arc_clone.blocking_lock();
-            if let Some(child) = vm_proc_guard.as_mut() {
-                // 等待子进程结束（blocking）
-                let _ = child.wait();
-                // 发送退出通知（blocking_send 用于在 blocking context send）
-                let _ = exit_notify_clone.blocking_send(());
+            loop {
+                {
+                    // blocking_lock 会阻塞直到能获取 Mutex
+                    let mut vm_proc_guard = vm_process_arc_clone.blocking_lock();
+                    if let Some(child) = vm_proc_guard.as_mut() {
+                        match child.try_wait() {
+                            Ok(Some(_)) => {
+                                // Process exited
+                                let _ = exit_notify_clone.blocking_send(());
+                                break;
+                            }
+                            Ok(None) => {
+                                // Still running
+                            }
+                            Err(_e) => {
+                                // Error
+                                let _ = exit_notify_clone.blocking_send(());
+                                break;
+                            }
+                        }
+                    } else {
+                        // No child process?
+                        break;
+                    }
+                } // Lock released here
+                
+                // Sleep to avoid busy loop
+                std::thread::sleep(std::time::Duration::from_millis(500));
             }
         });
 
@@ -114,8 +144,7 @@ impl ShyperInner {
     
     // 核心：获取 Agent 套接字（返回错误）
     pub async fn get_agent_socket(&self) -> Result<String> {
-        info!(sl(), "get_agent_socket called, returning error as planned");
-        Err(anyhow!("get_agent_socket is not supported"))
+        Ok(String::from("vsock://3:1024"))
     }
     
     // 核心：获取 VMM 进程 ID
@@ -138,6 +167,14 @@ impl ShyperInner {
         }
     }
 
+    pub async fn get_ns_path(&self) -> Result<String> {
+        Ok(format!(
+            "/proc/{}/task/{}/ns",
+            std::process::id(),
+            std::process::id()
+        ))
+    }
+
     // 核心：清理资源
     pub async fn cleanup(&self) -> Result<()> {
         info!(sl(), "cleanup called, no specific resources to clean up");
@@ -153,5 +190,22 @@ impl ShyperInner {
     // 辅助方法
     pub fn hypervisor_config(&self) -> HypervisorConfig {
         self.config.clone()
+    }
+
+    pub async fn save(&self) -> Result<HypervisorState> {
+        info!(sl(), "Saving Shyper hypervisor state: {:?}", self.config);
+        Ok(HypervisorState {
+            hypervisor_type: HYPERVISOR_SHYPER.to_string(),
+            config: self.config.clone(),
+            ..Default::default()
+        })
+    }
+
+    pub async fn restore(exit_notify: Sender<()>, state: HypervisorState) -> Result<Self> {
+        Ok(Self {
+            vm_process: Arc::new(Mutex::new(None)),
+            exit_notify,
+            config: state.config,
+        })
     }
 }

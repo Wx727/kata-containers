@@ -146,7 +146,7 @@ block_device_driver = "virtio-blk-mmio"
 # to enable debug output where available.
 #
 # Default false
-#enable_debug = true
+enable_debug = true
 
 # Disable the customizations done in the runtime when it detects
 # that it is running on top a VMM. This will result in the runtime
@@ -230,7 +230,7 @@ disable_selinux=false
 [agent.kata]
 # If enabled, make the agent display debug-level messages.
 # (default: disabled)
-#enable_debug = true
+enable_debug = true
 
 # Enable agent tracing.
 #
@@ -244,7 +244,7 @@ disable_selinux=false
 #   increasing the container shutdown time slightly.
 #
 # (default: disabled)
-#enable_tracing = true
+enable_tracing = true
 
 # Comma separated list of kernel modules and their parameters.
 # These modules will be loaded in the guest kernel using modprobe(8).
@@ -264,7 +264,7 @@ kernel_modules=[]
 # If enabled, user can connect guest OS running inside hypervisor
 # through "kata-runtime exec <sandbox-id>" command
 
-#debug_console_enabled = true
+debug_console_enabled = true
 
 # Agent connection dialing timeout value in seconds
 # (default: 45)
@@ -291,7 +291,7 @@ dial_timeout = 45
 # If enabled, the runtime will log additional debug messages to the
 # system log
 # (default: disabled)
-#enable_debug = true
+enable_debug = true
 #
 # Internetworking model
 # Determines how the VM should be connected to the
@@ -325,7 +325,7 @@ disable_guest_seccomp=true
 # If enabled, the runtime will create opentracing.io traces and spans.
 # (See https://www.jaegertracing.io/docs/getting-started).
 # (default: disabled)
-#enable_tracing = true
+enable_tracing = true
 
 # Set the full url to the Jaeger HTTP Thrift collector.
 # The default if not set will be "http://localhost:14268/api/traces"

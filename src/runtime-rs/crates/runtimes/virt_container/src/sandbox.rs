@@ -851,6 +851,7 @@ impl Persist for VirtSandbox {
     /// Save a state of Sandbox
     async fn save(&self) -> Result<Self::State> {
         let hypervisor_state = self.hypervisor.save_state().await?;
+        info!(sl!(), "Saving sandbox state, hypervisor type: '{}'", hypervisor_state.hypervisor_type);
         let sandbox_state = crate::sandbox_persist::SandboxState {
             sandbox_type: VIRTCONTAINER.to_string(),
             resource: Some(self.resource_manager.save().await?),
@@ -902,6 +903,10 @@ impl Persist for VirtSandbox {
             }
             HYPERVISOR_QEMU => {
                 let hypervisor = Arc::new(Qemu::restore((), h).await?) as Arc<dyn Hypervisor>;
+                Ok(hypervisor)
+            }
+            HYPERVISOR_SHYPER => {
+                let hypervisor = Arc::new(hypervisor::shyper::Shyper::restore((), h).await?) as Arc<dyn Hypervisor>;
                 Ok(hypervisor)
             }
             _ => Err(anyhow!("Unsupported hypervisor {}", &h.hypervisor_type)),
