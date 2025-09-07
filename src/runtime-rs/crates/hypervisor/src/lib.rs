@@ -16,6 +16,7 @@ use device::DeviceType;
 #[cfg(feature = "dragonball")]
 pub mod dragonball;
 pub mod firecracker;
+pub mod shyper;
 mod kernel_param;
 pub mod qemu;
 pub mod remote;
@@ -65,6 +66,7 @@ pub const HYPERVISOR_DRAGONBALL: &str = "dragonball";
 pub const HYPERVISOR_QEMU: &str = "qemu";
 pub const HYPERVISOR_FIRECRACKER: &str = "firecracker";
 pub const HYPERVISOR_REMOTE: &str = "remote";
+pub const HYPERVISOR_SHYPER: &str = "shyper";
 
 pub const DEFAULT_HYBRID_VSOCK_NAME: &str = "kata.hvsock";
 pub const JAILER_ROOT: &str = "root";

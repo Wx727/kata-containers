@@ -26,11 +26,13 @@ use hypervisor::{dragonball::Dragonball, HYPERVISOR_DRAGONBALL};
 use hypervisor::{firecracker::Firecracker, HYPERVISOR_FIRECRACKER};
 use hypervisor::{qemu::Qemu, HYPERVISOR_QEMU};
 use hypervisor::{remote::Remote, HYPERVISOR_REMOTE};
+use hypervisor::{shyper::Shyper, HYPERVISOR_SHYPER};
 #[cfg(feature = "dragonball")]
 use kata_types::config::DragonballConfig;
 use kata_types::config::FirecrackerConfig;
 use kata_types::config::RemoteConfig;
 use kata_types::config::{hypervisor::register_hypervisor_plugin, QemuConfig, TomlConfig};
+use kata_types::config::ShyperConfig;
 
 #[cfg(all(
     feature = "cloud-hypervisor",
@@ -83,6 +85,9 @@ impl RuntimeHandler for VirtContainer {
 
         let remote_config = Arc::new(RemoteConfig::new());
         register_hypervisor_plugin("remote", remote_config);
+
+        let shyper_config = Arc::new(ShyperConfig::new());
+        register_hypervisor_plugin("shyper", shyper_config);
 
         Ok(())
     }
@@ -200,6 +205,13 @@ async fn new_hypervisor(toml_config: &TomlConfig) -> Result<Arc<dyn Hypervisor>>
         }
         HYPERVISOR_REMOTE => {
             let hypervisor = Remote::new();
+            hypervisor
+                .set_hypervisor_config(hypervisor_config.clone())
+                .await;
+            Ok(Arc::new(hypervisor))
+        }
+        HYPERVISOR_SHYPER => {
+            let hypervisor = Shyper::new();
             hypervisor
                 .set_hypervisor_config(hypervisor_config.clone())
                 .await;

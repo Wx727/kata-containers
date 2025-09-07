@@ -25,6 +25,7 @@ use hypervisor::PortDeviceConfig;
 use hypervisor::VsockConfig;
 use hypervisor::HYPERVISOR_FIRECRACKER;
 use hypervisor::HYPERVISOR_REMOTE;
+use hypervisor::HYPERVISOR_SHYPER;
 #[cfg(feature = "dragonball")]
 use hypervisor::{dragonball::Dragonball, HYPERVISOR_DRAGONBALL};
 use hypervisor::{qemu::Qemu, HYPERVISOR_QEMU};
@@ -861,6 +862,7 @@ impl Persist for VirtSandbox {
                 HYPERVISOR_FIRECRACKER => Ok(Some(hypervisor_state)),
                 HYPERVISOR_QEMU => Ok(Some(hypervisor_state)),
                 HYPERVISOR_REMOTE => Ok(Some(hypervisor_state)),
+                HYPERVISOR_SHYPER => Ok(Some(hypervisor_state)),
                 _ => Err(anyhow!(
                     "Unsupported hypervisor {}",
                     hypervisor_state.hypervisor_type

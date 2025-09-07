@@ -48,6 +48,9 @@ pub use self::ch::{CloudHypervisorConfig, HYPERVISOR_NAME_CH};
 mod remote;
 pub use self::remote::{RemoteConfig, HYPERVISOR_NAME_REMOTE};
 
+mod shyper;
+pub use self::shyper::{ShyperConfig, HYPERVISOR_NAME_SHYPER};
+
 /// Virtual PCI block device driver.
 pub const VIRTIO_BLK_PCI: &str = "virtio-blk-pci";
 
@@ -590,6 +593,7 @@ impl TopologyConfigInfo {
             HYPERVISOR_NAME_DRAGONBALL,
             HYPERVISOR_NAME_FIRECRACKER,
             HYPERVISOR_NAME_REMOTE,
+            HYPERVISOR_NAME_SHYPER,
         ];
         let hypervisor_name = toml_config.runtime.hypervisor_name.as_str();
         if !hypervisor_names.contains(&hypervisor_name) {
