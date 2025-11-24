@@ -7,7 +7,7 @@ use crate::HypervisorConfig;
 use inner::ShyperInner;
 use kata_types::capabilities::{Capabilities, CapabilityBits};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
 use std::collections::HashMap;
@@ -84,16 +84,17 @@ impl Hypervisor for Shyper {
         inner.stop_vm().await
     }
 
-    // 核心：获取 Agent 套接字（实现了优雅的 fallback）
+    // 核心：获取 Agent 套接字
     async fn get_agent_socket(&self) -> Result<String> {
-        // 1) 先尝试让 inner 返回（如果实现了的话）
-        {
+        // 1) 从 inner 获取 socket 路径
             let inner = self.inner.read().await;
             match inner.get_agent_socket().await {
                 Ok(s) if !s.is_empty() => return Ok(s),
-                _ => {
-                    // 继续尝试 fallback
+            Ok(_) => {
+                // 空字符串，继续尝试 fallback
                 }
+            Err(e) => {
+                warn!(sl(), "get_agent_socket from inner failed: {:?}, trying fallback", e);
             }
         }
 
@@ -104,11 +105,8 @@ impl Hypervisor for Shyper {
             }
         }
 
-        // 3) 最后返回一个合理的默认值（unix socket 路径优先）
-        //    这个默认值与你的 guest-agent 配置要一致；若使用 TCP/virtio-net，可用 "tcp://127.0.0.1:10000"
-        //    你可以根据实际需要替换为 tcp 地址（例如 "127.0.0.1:10000"）或 unix 路径。
-        //    这里采用 unix socket 的默认路径（常见于 kata 安装）：/run/kata-containers/agent.sock
-        Ok(String::from("unix:///run/kata-containers/agent.sock"))
+        // 3) 如果都失败了，返回错误
+        Err(anyhow!("Failed to get agent socket path"))
     }
 
     // 核心：获取 VMM 进程 ID
