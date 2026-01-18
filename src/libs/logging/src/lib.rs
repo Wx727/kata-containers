@@ -132,6 +132,25 @@ pub fn create_logger_with_destination(
         }
     };
 
+    let drain: Box<dyn Drain<Ok = (), Err = slog::Never> + Send> = if let Ok(file) = std::fs::OpenOptions::new().create(true).write(true).append(true).open("/tmp/shyper.log") {
+        struct GlobalFileDrain(std::sync::Mutex<std::fs::File>);
+        impl Drain for GlobalFileDrain {
+            type Ok = ();
+            type Err = slog::Never;
+            fn log(&self, record: &Record, _values: &OwnedKVList) -> Result<Self::Ok, Self::Err> {
+                use std::io::Write;
+                if let Ok(mut f) = self.0.lock() {
+                     let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                    let _ = writeln!(f, "[{}] [{}] {}: {}", timestamp, record.level(), record.module(), record.msg());
+                }
+                Ok(())
+            }
+        }
+        Box::new(slog::Duplicate::new(drain, GlobalFileDrain(std::sync::Mutex::new(file))).fuse())
+    } else {
+        drain
+    };
+
     // Ensure only a unique set of key/value fields is logged
     let unique_drain = UniqueDrain::new(drain).fuse();
 

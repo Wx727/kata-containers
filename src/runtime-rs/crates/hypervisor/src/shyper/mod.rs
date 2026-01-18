@@ -152,6 +152,8 @@ impl Hypervisor for Shyper {
     }
 
     async fn add_device(&self, device: DeviceType) -> Result<DeviceType> {
+        let mut inner = self.inner.write().await;
+        inner.add_device(device.clone()).await?;
         Ok(device)
     }
 
@@ -194,7 +196,7 @@ impl Hypervisor for Shyper {
 
     async fn capabilities(&self) -> Result<Capabilities> {
         let mut caps = Capabilities::default();
-        caps.set(CapabilityBits::FsSharingSupport);
+        caps.set(CapabilityBits::BlockDeviceSupport);
         Ok(caps)
     }
 
@@ -211,7 +213,7 @@ impl Hypervisor for Shyper {
     }
 
     async fn get_passfd_listener_addr(&self) -> Result<(String, u32)> {
-        Ok((String::new(), 0))
+        Err(anyhow::anyhow!("Not yet supported"))
     }
 }
 
