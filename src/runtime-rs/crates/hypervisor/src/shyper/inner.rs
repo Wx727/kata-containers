@@ -1,20 +1,72 @@
-use crate::HypervisorConfig;
-use crate::shyper::sl;
-use crate::hypervisor_persist::HypervisorState;
-use crate::HYPERVISOR_SHYPER;
 use crate::device::DeviceType;
+use crate::hypervisor_persist::HypervisorState;
+use crate::shyper::sl;
+use crate::{HypervisorConfig, NetworkDevice, HYPERVISOR_SHYPER};
 
 use anyhow::{anyhow, Context, Result};
-use std::process::{Child, Command, Stdio};
+use serde_json::Value;
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
+use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::Mutex;
-use std::sync::Arc;
-use serde_json::Value;
 
 const DISK_POOL_SIZE: usize = 2;
 const DUMMY_FILE_SIZE: u64 = 10 * 1024 * 1024 * 1024; // 10GB
+const SHYPER_VIRTIO_NET_TYPE: &str = "EMU_DEVICE_T_VIRTIO_NET";
+
+fn pending_network_device(devices: &[DeviceType]) -> Result<Option<&NetworkDevice>> {
+    let mut networks = devices.iter().filter_map(|device| match device {
+        DeviceType::Network(network) => Some(network),
+        _ => None,
+    });
+
+    let network = networks.next();
+    if networks.next().is_some() {
+        return Err(anyhow!(
+            "Shyper currently supports only one network device per GVM"
+        ));
+    }
+
+    Ok(network)
+}
+
+fn update_network_config(
+    kata_config: &mut Value,
+    devices: &[DeviceType],
+) -> Result<Option<[u8; 6]>> {
+    let Some(network) = pending_network_device(devices)? else {
+        return Ok(None);
+    };
+    let mac = network
+        .config
+        .guest_mac
+        .as_ref()
+        .context("Shyper network device is missing a guest MAC address")?
+        .0;
+
+    let emulated_devices = kata_config
+        .pointer_mut("/emulated_device/emulated_device_list")
+        .and_then(Value::as_array_mut)
+        .context("Shyper configuration is missing emulated_device.emulated_device_list")?;
+    let mut network_devices = emulated_devices.iter_mut().filter(|device| {
+        device.get("type").and_then(Value::as_str) == Some(SHYPER_VIRTIO_NET_TYPE)
+    });
+    let network_config = network_devices
+        .next()
+        .context("Shyper configuration is missing a virtio-net device")?;
+    if network_devices.next().is_some() {
+        return Err(anyhow!(
+            "Shyper configuration contains more than one virtio-net device"
+        ));
+    }
+
+    network_config["cfg_num"] = serde_json::json!(mac.len());
+    network_config["cfg_list"] = serde_json::json!(mac);
+
+    Ok(Some(mac))
+}
 
 pub struct ShyperInner {
     vm_process: Arc<Mutex<Option<Child>>>,
@@ -72,6 +124,18 @@ impl ShyperInner {
                      info!(sl(), "Updating Vsock CID to {}", vsock.config.guest_cid);
                      self.vsock_cid = vsock.config.guest_cid;
                  }
+            }
+            if let DeviceType::Network(ref network) = device {
+                if network.config.guest_mac.is_none() {
+                    return Err(anyhow!(
+                        "Shyper network device is missing a guest MAC address"
+                    ));
+                }
+                if pending_network_device(&self.pending_devices)?.is_some() {
+                    return Err(anyhow!(
+                        "Shyper currently supports only one network device per GVM"
+                    ));
+                }
             }
             self.pending_devices.push(device);
             return Ok(());
@@ -175,6 +239,10 @@ impl ShyperInner {
              return Ok(());
         }
 
+        if matches!(&device, DeviceType::Network(_)) {
+            return Err(anyhow!("Shyper does not support network device hotplug"));
+        }
+
         warn!(sl(), "Unsupported device type for hotplug: {:?}", device);
         Ok(())
     }
@@ -265,6 +333,19 @@ impl ShyperInner {
         let template_path = format!("{}/kata.json", work_dir);
         let f = File::open(&template_path).context(format!("open kata.json template {}", template_path))?;
         let mut kata_config: Value = serde_json::from_reader(f).context("parse kata.json")?;
+
+        if let Some(mac) = update_network_config(&mut kata_config, &self.pending_devices)? {
+            info!(
+                sl(),
+                "Updating Shyper virtio-net guest MAC to {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                mac[0],
+                mac[1],
+                mac[2],
+                mac[3],
+                mac[4],
+                mac[5]
+            );
+        }
         
         // Fix Rootfs Kernel Command Line if needed
         // If the user provided a partitioned image (standard Kata image), we likely need root=/dev/vda1
@@ -601,5 +682,112 @@ impl ShyperInner {
             device_slots: Default::default(),
             vsock_cid: 3,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Address, NetworkConfig};
+    use serde_json::json;
+
+    fn shyper_config() -> Value {
+        json!({
+            "emulated_device": {
+                "emulated_device_list": [
+                    {
+                        "type": "EMU_DEVICE_T_VIRTIO_BLK_MEDIATED",
+                        "cfg_num": 2,
+                        "cfg_list": [0, 1024]
+                    },
+                    {
+                        "type": SHYPER_VIRTIO_NET_TYPE,
+                        "cfg_num": 6,
+                        "cfg_list": [116, 86, 170, 15, 71, 209]
+                    }
+                ]
+            }
+        })
+    }
+
+    fn network_device(mac: Option<[u8; 6]>) -> DeviceType {
+        DeviceType::Network(NetworkDevice {
+            device_id: "network-0".to_string(),
+            config: NetworkConfig {
+                guest_mac: mac.map(Address),
+                ..Default::default()
+            },
+        })
+    }
+
+    #[test]
+    fn update_network_config_uses_kata_guest_mac() {
+        let mut config = shyper_config();
+        let mac = [0x02, 0x00, 0x00, 0x12, 0x34, 0x56];
+
+        let updated_mac = update_network_config(&mut config, &[network_device(Some(mac))])
+            .expect("update network config");
+
+        assert_eq!(updated_mac, Some(mac));
+        assert_eq!(
+            config.pointer("/emulated_device/emulated_device_list/1/cfg_list"),
+            Some(&json!([2, 0, 0, 18, 52, 86]))
+        );
+        assert_eq!(
+            config.pointer("/emulated_device/emulated_device_list/1/cfg_num"),
+            Some(&json!(6))
+        );
+    }
+
+    #[test]
+    fn update_network_config_keeps_template_without_kata_network_device() {
+        let mut config = shyper_config();
+        let original = config.clone();
+
+        let updated_mac = update_network_config(&mut config, &[]).expect("update network config");
+
+        assert_eq!(updated_mac, None);
+        assert_eq!(config, original);
+    }
+
+    #[test]
+    fn update_network_config_rejects_missing_guest_mac() {
+        let mut config = shyper_config();
+
+        let error = update_network_config(&mut config, &[network_device(None)])
+            .expect_err("missing guest MAC must fail");
+
+        assert!(error.to_string().contains("missing a guest MAC"));
+    }
+
+    #[test]
+    fn update_network_config_rejects_multiple_network_devices() {
+        let mut config = shyper_config();
+        let devices = [
+            network_device(Some([0x02, 0, 0, 0, 0, 1])),
+            network_device(Some([0x02, 0, 0, 0, 0, 2])),
+        ];
+
+        let error = update_network_config(&mut config, &devices)
+            .expect_err("multiple network devices must fail");
+
+        assert!(error.to_string().contains("only one network device"));
+    }
+
+    #[test]
+    fn update_network_config_requires_template_network_device() {
+        let mut config = json!({
+            "emulated_device": {
+                "emulated_device_list": []
+            }
+        });
+
+        let error = update_network_config(
+            &mut config,
+            &[network_device(Some([0x02, 0, 0, 0, 0, 1]))],
+        )
+        .expect_err("missing template network device must fail");
+
+        assert!(error.to_string().contains("missing a virtio-net device"));
     }
 }
