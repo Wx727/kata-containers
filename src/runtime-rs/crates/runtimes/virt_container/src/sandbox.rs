@@ -58,6 +58,12 @@ use tracing::instrument;
 
 pub(crate) const VIRTCONTAINER: &str = "virt_container";
 
+// nerdctl normally discovers the target network namespace from the PID in the
+// OCI hook state.  Shyper's userspace daemon stays in the MVM network
+// namespace, so its PID cannot be used for that purpose.  nerdctl prefers this
+// annotation over the PID when it is present.
+const NERDCTL_NETWORK_NAMESPACE_ANNOTATION: &str = "nerdctl/network-namespace";
+
 pub struct SandboxRestoreArgs {
     pub sid: String,
     pub toml_config: TomlConfig,
@@ -132,6 +138,7 @@ impl VirtSandbox {
         &self,
         id: &str,
         network_env: SandboxNetworkEnv,
+        network_prepared_by_early_hook: bool,
     ) -> Result<Vec<ResourceConfig>> {
         let mut resource_configs = vec![];
 
@@ -143,7 +150,7 @@ impl VirtSandbox {
         resource_configs.push(vm_socket_config);
 
         // prepare network config
-        if !network_env.network_created {
+        if !network_env.network_created || network_prepared_by_early_hook {
             if let Some(network_resource) = self.prepare_network_resource(&network_env).await {
                 resource_configs.push(network_resource);
             }
@@ -285,6 +292,41 @@ impl VirtSandbox {
         let mut create_runtime_hook_states = HookStates::new();
         create_runtime_hook_states.execute_hooks(create_runtime_hooks, Some(st.clone()))?;
         Ok(())
+    }
+
+    fn is_nerdctl_network_hook(hook: &oci::Hook) -> bool {
+        hook.args().as_ref().is_some_and(|args| {
+            args.windows(3).any(|window| {
+                window[0] == "internal" && window[1] == "oci-hook" && window[2] == "createRuntime"
+            })
+        })
+    }
+
+    fn state_with_network_namespace(state: &spec::State, netns_path: &str) -> spec::State {
+        let mut state = state.clone();
+        state.annotations.insert(
+            NERDCTL_NETWORK_NAMESPACE_ANNOTATION.to_string(),
+            netns_path.to_string(),
+        );
+        state
+    }
+
+    fn execute_early_network_hooks(
+        &self,
+        hooks: &[oci::Hook],
+        state: &spec::State,
+        netns_path: &str,
+    ) -> Result<()> {
+        let state = Self::state_with_network_namespace(state, netns_path);
+
+        info!(
+            sl!(),
+            "execute nerdctl network hook before starting Shyper VM in netns {}", netns_path
+        );
+        let mut hook_states = HookStates::new();
+        hook_states
+            .execute_hooks(hooks, Some(state))
+            .context("execute nerdctl network hook before starting Shyper VM")
     }
 
     // store_guest_details will get the information from the guest OS, like memory block size, agent details and is memory hotplug probe support
@@ -493,6 +535,59 @@ impl VirtSandbox {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn hook(args: Vec<&str>) -> oci::Hook {
+        oci::HookBuilder::default()
+            .path(PathBuf::from("/usr/local/bin/nerdctl"))
+            .args(args.into_iter().map(String::from).collect::<Vec<_>>())
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn identifies_nerdctl_create_runtime_network_hook() {
+        let network_hook = hook(vec![
+            "nerdctl",
+            "--namespace=default",
+            "internal",
+            "oci-hook",
+            "createRuntime",
+        ]);
+        assert!(VirtSandbox::is_nerdctl_network_hook(&network_hook));
+
+        let unrelated_hook = hook(vec!["some-hook", "createRuntime"]);
+        assert!(!VirtSandbox::is_nerdctl_network_hook(&unrelated_hook));
+    }
+
+    #[test]
+    fn adds_netns_annotation_without_overwriting_existing_annotations() {
+        let state = spec::State {
+            version: "1.0.2".to_string(),
+            id: "sandbox-id".to_string(),
+            status: spec::ContainerState::Creating,
+            pid: 0,
+            bundle: "/run/containerd/bundle".to_string(),
+            annotations: HashMap::from([("existing".to_string(), "value".to_string())]),
+        };
+
+        let state = VirtSandbox::state_with_network_namespace(&state, "/run/netns/kata-test");
+
+        assert_eq!(state.annotations.get("existing").unwrap(), "value");
+        assert_eq!(
+            state
+                .annotations
+                .get(NERDCTL_NETWORK_NAMESPACE_ANNOTATION)
+                .unwrap(),
+            "/run/netns/kata-test"
+        );
+    }
+}
+
 #[async_trait]
 impl Sandbox for VirtSandbox {
     #[instrument(name = "sb: start")]
@@ -503,6 +598,35 @@ impl Sandbox for VirtSandbox {
             return Err(anyhow!("sandbox config is missing"));
         }
         let sandbox_config = self.sandbox_config.as_ref().unwrap();
+
+        let (prestart_hooks, create_runtime_hooks) =
+            if let Some(hooks) = sandbox_config.hooks.as_ref() {
+                (
+                    hooks.prestart().clone().unwrap_or_default(),
+                    hooks.create_runtime().clone().unwrap_or_default(),
+                )
+            } else {
+                (Vec::new(), Vec::new())
+            };
+
+        // nerdctl configures CNI from a createRuntime hook.  For a conventional
+        // VMM the hook uses the VMM PID to find its network namespace and Kata
+        // rescans that namespace after the VM starts.  That is too late for
+        // Shyper because the virtio-net MAC is part of the boot-time VM JSON and
+        // Shyper does not support network hotplug.  Run only nerdctl's network
+        // hook early, tell it the namespace path explicitly, then include the
+        // resulting endpoint while preparing the VM.
+        let config = self.resource_manager.config().await;
+        let prepare_shyper_network_before_vm = config.runtime.hypervisor_name == HYPERVISOR_SHYPER
+            && sandbox_config.network_env.network_created
+            && sandbox_config.network_env.netns.is_some()
+            && !config.runtime.disable_new_netns
+            && !dan_config_path(&config, &self.sid).exists();
+
+        let (early_create_runtime_hooks, late_create_runtime_hooks): (Vec<_>, Vec<_>) =
+            create_runtime_hooks.into_iter().partition(|hook| {
+                prepare_shyper_network_before_vm && Self::is_nerdctl_network_hook(hook)
+            });
 
         // if sandbox is not in SandboxState::Init then return,
         // otherwise try to create sandbox
@@ -522,10 +646,27 @@ impl Sandbox for VirtSandbox {
             .await
             .context("prepare vm")?;
 
+        if !early_create_runtime_hooks.is_empty() {
+            let netns_path = sandbox_config
+                .network_env
+                .netns
+                .as_deref()
+                .context("missing Shyper network namespace for early CNI hook")?;
+            self.execute_early_network_hooks(
+                &early_create_runtime_hooks,
+                &sandbox_config.state,
+                netns_path,
+            )?;
+        }
+
         // generate device and setup before start vm
         // should after hypervisor.prepare_vm
         let resources = self
-            .prepare_for_start_sandbox(id, sandbox_config.network_env.clone())
+            .prepare_for_start_sandbox(
+                id,
+                sandbox_config.network_env.clone(),
+                !early_create_runtime_hooks.is_empty(),
+            )
             .await?;
 
         self.resource_manager
@@ -537,20 +678,9 @@ impl Sandbox for VirtSandbox {
         self.hypervisor.start_vm(10_000).await.context("start vm")?;
         info!(sl!(), "start vm");
 
-        // execute pre-start hook functions, including Prestart Hooks and CreateRuntime Hooks
-        let (prestart_hooks, create_runtime_hooks) =
-            if let Some(hooks) = sandbox_config.hooks.as_ref() {
-                (
-                    hooks.prestart().clone().unwrap_or_default(),
-                    hooks.create_runtime().clone().unwrap_or_default(),
-                )
-            } else {
-                (Vec::new(), Vec::new())
-            };
-
         self.execute_oci_hook_functions(
             &prestart_hooks,
-            &create_runtime_hooks,
+            &late_create_runtime_hooks,
             &sandbox_config.state,
         )
         .await?;
@@ -560,7 +690,8 @@ impl Sandbox for VirtSandbox {
         // 2. Do not scan the netns if we want no network for the VM.
         // TODO In case of vm factory, scan the netns to hotplug interfaces after the VM is started.
         let config = self.resource_manager.config().await;
-        if self.has_prestart_hooks(&prestart_hooks, &create_runtime_hooks)
+        if early_create_runtime_hooks.is_empty()
+            && self.has_prestart_hooks(&prestart_hooks, &late_create_runtime_hooks)
             && !config.runtime.disable_new_netns
             && !dan_config_path(&config, &self.sid).exists()
         {
